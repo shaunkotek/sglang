@@ -220,6 +220,19 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
+class StructuredOutputsParams(BaseModel):
+    """vLLM-compatible nested structured-output parameters.
+
+    SGLang currently exposes other constraints through its native top-level
+    fields. Keep this compatibility surface explicit until those forms have a
+    well-defined mapping as well.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    regex: str
+
+
 class StructuresResponseFormat(BaseModel):
     begin: str
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
@@ -720,6 +733,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: Optional[float] = None
     min_tokens: int = 0
     regex: Optional[str] = None
+    structured_outputs: Optional[StructuredOutputsParams] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
     stop_token_ids: Optional[List[int]] = None
@@ -832,6 +846,27 @@ class ChatCompletionRequest(BaseModel):
             ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_structured_outputs(cls, values: Dict):
+        structured_outputs = values.get("structured_outputs")
+        if structured_outputs is None:
+            return values
+        if isinstance(structured_outputs, StructuredOutputsParams):
+            nested_regex = structured_outputs.regex
+        elif isinstance(structured_outputs, dict):
+            nested_regex = structured_outputs.get("regex")
+        else:
+            return values
+        if values.get("regex") is not None:
+            raise ValueError(
+                "Specify regex either at the top level or in "
+                "structured_outputs, not both."
+            )
+        if nested_regex is not None:
+            values["regex"] = nested_regex
         return values
 
     @model_validator(mode="before")

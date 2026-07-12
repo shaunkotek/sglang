@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    StructuredOutputsParams,
     Tool,
     UsageInfo,
 )
@@ -140,6 +141,46 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["max_new_tokens"], 150)
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
+
+    def test_vllm_structured_outputs_regex(self):
+        regex = r"[a-zA-Z0-9_.]+@enigma\.com\n*"
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Generate an email"}],
+                "structured_outputs": {"regex": regex},
+            }
+        )
+
+        self.assertEqual(req.structured_outputs.regex, regex)
+        self.assertEqual(req.regex, regex)
+        params = req.to_sampling_params([], {}, None)
+        self.assertEqual(params["regex"], regex)
+
+    def test_vllm_structured_outputs_regex_conflicts_with_top_level(self):
+        with self.assertRaisesRegex(
+            ValidationError,
+            "Specify regex either at the top level or in structured_outputs",
+        ):
+            ChatCompletionRequest.model_validate(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Generate an email"}],
+                    "regex": "top-level",
+                    "structured_outputs": {"regex": "nested"},
+                }
+            )
+
+    def test_vllm_structured_outputs_regex_model_input(self):
+        regex = r"[a-zA-Z0-9_.]+@enigma\.com\n*"
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Generate an email"}],
+            structured_outputs=StructuredOutputsParams(regex=regex),
+        )
+
+        self.assertEqual(req.regex, regex)
+        self.assertEqual(req.to_sampling_params([], {}, None)["regex"], regex)
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
