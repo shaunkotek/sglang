@@ -1,6 +1,7 @@
 import itertools
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -8,9 +9,16 @@ from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
+)
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptNvFp4FusedMoEMethod,
 )
 from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -31,6 +39,69 @@ def _has_aot_moe_wna16_marlin_gemm() -> bool:
 
 
 AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
+
+
+class _ModelOptNvFp4ConfigStub:
+    def __init__(self, quant_method):
+        self.quant_method = quant_method
+
+    def get_name(self):
+        return "modelopt_fp4"
+
+    def get_quant_method(self, _layer, _prefix):
+        return self.quant_method
+
+
+def _make_modelopt_fused_moe(*, configured_backend, routed_scaling_factor):
+    """Build enough of FusedMoE to exercise backend resolution and scale policy."""
+    quant_method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+    quant_method.create_weights = Mock()
+    quant_config = _ModelOptNvFp4ConfigStub(quant_method)
+    parallel = SimpleNamespace(
+        moe_ep_size=1,
+        moe_ep_rank=0,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+    )
+    a2a_backend = SimpleNamespace(is_ascend_fuseep=lambda: False)
+
+    with (
+        patch.object(
+            fused_moe_layer,
+            "get_moe_runner_backend",
+            return_value=configured_backend,
+        ),
+        patch.object(
+            modelopt_quant,
+            "get_moe_runner_backend",
+            return_value=configured_backend,
+        ),
+        # The backend resolver itself remains real. Avoid constructing its
+        # heavyweight runner because this test invokes Marlin directly below.
+        patch.object(modelopt_quant, "MoeRunner", return_value=Mock()),
+        patch.object(fused_moe_layer, "get_parallel", return_value=parallel),
+        patch.object(
+            fused_moe_layer, "create_kt_config_from_server_args", return_value=None
+        ),
+        patch.object(
+            fused_moe_layer,
+            "get_server_args",
+            return_value=SimpleNamespace(moe_runner_backend=configured_backend.value),
+        ),
+        patch.object(fused_moe_layer, "create_moe_dispatcher", return_value=Mock()),
+        patch.object(fused_moe_layer, "get_moe_a2a_backend", return_value=a2a_backend),
+        patch.object(fused_moe_layer, "print_info_once"),
+    ):
+        return fused_moe_layer.FusedMoE(
+            num_experts=4,
+            hidden_size=256,
+            intermediate_size=192,
+            layer_id=0,
+            top_k=2,
+            quant_config=quant_config,
+            routed_scaling_factor=routed_scaling_factor,
+            is_gated=False,
+        )
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -512,9 +583,14 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
 
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
-    reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
+    reason="ModelOpt NVFP4 Marlin scale test requires CUDA SM80, SM86, or SM90",
 )
-def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
+@pytest.mark.parametrize(
+    "configured_backend",
+    [MoeRunnerBackend.MARLIN, MoeRunnerBackend.AUTO],
+    ids=["explicit-marlin", "auto-resolves-to-marlin"],
+)
+def test_modelopt_nvfp4_marlin_routed_scale_applied_once(configured_backend):
     torch.manual_seed(0)
 
     m = 17
@@ -568,12 +644,56 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     )
     prepare_moe_nvfp4_layer_for_marlin(layer)
 
+    policy_layer = _make_modelopt_fused_moe(
+        configured_backend=configured_backend,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    assert policy_layer.quant_method._moe_runner_backend.is_marlin()
+
     # Scale activations down so relu² doesn't blow up intermediate magnitudes;
     # this keeps output values small so tighter element-wise tolerance is realistic.
     hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 20
     router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
-    score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-    topk_weights, topk_ids = torch.topk(score_softmax, topk)
+    correction_bias = torch.randn((e,), device="cuda", dtype=torch.float32) / 10
+
+    # This is the real grouped sigmoid routing path used by Nemotron-H. Before
+    # the fix ModelOpt always asks it to multiply the weights by the routed
+    # scale, even though Marlin also multiplies the reduced output by it.
+    topk_output = select_experts(
+        hidden_states,
+        router_logits,
+        TopKConfig(
+            top_k=topk,
+            use_grouped_topk=True,
+            topk_group=1,
+            num_expert_group=2,
+            renormalize=True,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=(
+                policy_layer.should_fuse_routed_scaling_factor_in_topk
+            ),
+            scoring_func="sigmoid",
+        ),
+    )
+    reference_topk_output = select_experts(
+        hidden_states,
+        router_logits,
+        TopKConfig(
+            top_k=topk,
+            use_grouped_topk=True,
+            topk_group=1,
+            num_expert_group=2,
+            renormalize=True,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=False,
+            scoring_func="sigmoid",
+        ),
+    )
+    torch.testing.assert_close(
+        topk_output.topk_ids, reference_topk_output.topk_ids, rtol=0, atol=0
+    )
 
     output = fused_marlin_moe(
         hidden_states=hidden_states,
@@ -582,8 +702,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         w1_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
         gating_output=router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
+        topk_weights=topk_output.topk_weights,
+        topk_ids=topk_output.topk_ids,
         w1_global_scale=layer.w13_weight_scale_2,
         w2_global_scale=layer.w2_weight_scale_2,
         workspace=layer.workspace,
@@ -599,15 +719,26 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     output_ref = torch.zeros_like(hidden_states)
     for token_idx in range(m):
         for route_idx in range(topk):
-            expert_id = topk_ids[token_idx, route_idx]
+            expert_id = reference_topk_output.topk_ids[token_idx, route_idx]
             intermediate = hidden_states[token_idx] @ w13_ref[expert_id].T
             intermediate = torch.square(torch.relu(intermediate))
             routed = intermediate @ w2_ref[expert_id].T
-            output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
+            output_ref[token_idx] += (
+                routed * reference_topk_output.topk_weights[token_idx, route_idx]
+            )
     output_ref *= routed_scaling_factor
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
+    # NVFP4 dequantization plus two BF16 GEMMs accumulates larger absolute
+    # error after the 2x routed scale. The exact assertion below separately
+    # guarantees that the router did not pre-apply that scale.
+    torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.75)
+    torch.testing.assert_close(
+        topk_output.topk_weights,
+        reference_topk_output.topk_weights,
+        rtol=0,
+        atol=0,
+    )
 
 
 if __name__ == "__main__":
