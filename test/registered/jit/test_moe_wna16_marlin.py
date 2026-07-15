@@ -648,7 +648,7 @@ def test_modelopt_nvfp4_marlin_routed_scale_applied_once(configured_backend):
         configured_backend=configured_backend,
         routed_scaling_factor=routed_scaling_factor,
     )
-    assert policy_layer.quant_method._moe_runner_backend.is_marlin()
+    assert policy_layer.quant_method.get_moe_runner_backend().is_marlin()
 
     # Scale activations down so relu² doesn't blow up intermediate magnitudes;
     # this keeps output values small so tighter element-wise tolerance is realistic.

@@ -2127,9 +2127,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         """
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self.get_moe_runner_backend()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
             # the gate/up columns to the gate scale here. Other backends keep the
@@ -2465,6 +2463,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if not moe_runner_backend.is_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
+    def get_moe_runner_backend(self) -> MoeRunnerBackend:
+        """Return the concrete backend selected by ``create_moe_runner``."""
+        return self._moe_runner_backend
+
     def apply(
         self,
         layer: FusedMoE,
@@ -2477,9 +2479,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self.get_moe_runner_backend()
 
         assert (
             activation in _SUPPORTED_ACT_STRS
