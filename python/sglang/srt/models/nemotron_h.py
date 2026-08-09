@@ -1150,7 +1150,8 @@ class NemotronHForCausalLM(nn.Module):
             if not is_mtp and "mtp" in name:
                 continue
 
-            if "scale" in name:
+            # Routed expert scales are handled by expert_params_mapping below.
+            if "scale" in name and ".experts." not in name:
                 if name not in params_dict:
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:

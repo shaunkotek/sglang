@@ -11,6 +11,7 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -88,6 +89,32 @@ class TestNemotronHWeightLoading(unittest.TestCase):
                 param,
                 loaded_weight,
                 "model.layers.1.mixer.experts.w2_weight",
+                "w2",
+                0,
+            ),
+        )
+
+    def test_expert_scale_bypasses_kv_scale_remapping(self):
+        param = _FakeParam()
+        model = self._make_minimal_model(
+            [("model.layers.1.mixer.experts.w2_weight_scale_2", param)]
+        )
+        loaded_weight = torch.ones(1)
+        weight_name = "model.layers.1.mixer.experts.0.down_proj.weight_scale_2"
+
+        with patch(
+            "sglang.srt.models.nemotron_h.maybe_remap_kv_scale_name",
+            side_effect=lambda name, _params_dict: name,
+        ) as remap_kv_scale:
+            model.load_weights([(weight_name, loaded_weight)])
+
+        remap_kv_scale.assert_not_called()
+        self.assertEqual(
+            param.loaded,
+            (
+                param,
+                loaded_weight,
+                "model.layers.1.mixer.experts.w2_weight_scale_2",
                 "w2",
                 0,
             ),
